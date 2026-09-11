@@ -217,11 +217,11 @@ void read_checkpoint(char* checkpoint, Config* config, TransformerWeights* weigh
     uint32_t magic_number;
     if (fread(&magic_number, sizeof(uint32_t), 1, file) != 1) { exit(EXIT_FAILURE); }
     if (magic_number != 0x616b3432) { fprintf(stderr, "Bad magic number\n"); exit(EXIT_FAILURE); }
-    // read in the version number (uint32), has to be 3
+    // read in the version number (uint32), has to be 2
     int version;
     if (fread(&version, sizeof(int), 1, file) != 1) { exit(EXIT_FAILURE); }
-    if (version != 3) { fprintf(stderr, "Bad version %d, need version 3\n", version); exit(EXIT_FAILURE); }
-    int header_size = 256; // the header size for version 3 in bytes
+    if (version != 2) { fprintf(stderr, "Bad version %d, need version 2\n", version); exit(EXIT_FAILURE); }
+    int header_size = 256; // the header size for version 2 in bytes
     // read in the Config
     if (fread(config, sizeof(Config), 1, file) != 1) { exit(EXIT_FAILURE); }
     // read in flags
