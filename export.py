@@ -317,9 +317,6 @@ def version3_export(model, filepath, group_size=64):
 
     # now let's write out all the params that we are quantizing to Q8_0
     # note we skip classifier weights, which are shared with the embedding
-    # Do not quantize the embedding weights since we would just dequantize them anyway
-    q_tokens, weights = weights[0], weights[1:]
-    serialize_fp32(out_file, q_tokens) # save the embedding weights in fp32
     ew = []
     for i, w in enumerate(weights):
         # quantize this weight

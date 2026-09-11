@@ -39,7 +39,7 @@ typedef struct {
 
 typedef struct {
     // token embedding table
-    float* token_embedding_table; // (vocab_size, dim)
+    QuantizedTensor *q_tokens; // (vocab_size, dim)
 
     // weights for rmsnorms
     float* rms_att_weight; // (layer, dim) rmsnorm weights
@@ -56,7 +56,7 @@ typedef struct {
     // final rmsnorm
     float* rms_final_weight; // (dim,)
     // (optional) classifier weights for the logits, on the last layer
-    float *wcls;
+    QuantizedTensor *wcls;
 } TransformerWeights;
 
 typedef struct {
@@ -190,11 +190,10 @@ void memory_map_weights(TransformerWeights *w, Config* p, void* ptr, uint8_t sha
     fptr += p->n_layers * p->dim;
     w->rms_final_weight = fptr;
     fptr += p->dim;
-    w->token_embedding_table = fptr;
-    fptr += p->vocab_size * p->dim;
 
     // now read all the quantized weights
     ptr = (void*)fptr; // now cast the pointer back to void*
+    w->q_tokens = init_quantized_tensors(&ptr, 1, p->vocab_size * p->dim);
 
     w->wq = init_quantized_tensors(&ptr, p->n_layers, p->dim * (p->n_heads * head_size));
     w->wk = init_quantized_tensors(&ptr, p->n_layers, p->dim * (p->n_kv_heads * head_size));
@@ -207,7 +206,7 @@ void memory_map_weights(TransformerWeights *w, Config* p, void* ptr, uint8_t sha
 
     // Force wcls to be float because it is shared with the token embedding table, which must be a float
     assert(shared_classifier);
-    w->wcls = w->token_embedding_table;
+    w->wcls = w->q_tokens;
 }
 
 void read_checkpoint(char* checkpoint, Config* config, TransformerWeights* weights,
@@ -225,9 +224,6 @@ void read_checkpoint(char* checkpoint, Config* config, TransformerWeights* weigh
     int header_size = 256; // the header size for version 3 in bytes
     // read in the Config
     if (fread(config, sizeof(Config), 1, file) != 1) { exit(EXIT_FAILURE); }
-    printf("Read config: dim=%d, hidden_dim=%d, n_layers=%d, n_heads=%d, n_kv_heads=%d, vocab_size=%d, seq_len=%d\n",
-           config->dim, config->hidden_dim, config->n_layers, config->n_heads,
-           config->n_kv_heads, config->vocab_size, config->seq_len);
     // read in flags
     uint8_t shared_classifier; // a byte to indicate if the classifier is shared
     if (fread(&shared_classifier, sizeof(uint8_t), 1, file) != 1) { exit(EXIT_FAILURE); }
@@ -256,6 +252,7 @@ void build_transformer(Transformer *t, char* checkpoint_path) {
 
 void free_transformer(Transformer* t) {
     // free QuantizedTensors
+    free(t->weights.q_tokens);
     free(t->weights.wq);
     free(t->weights.wk);
     free(t->weights.wv);
@@ -308,20 +305,6 @@ void softmax(float* x, int size) {
     }
 }
 
-void matmul_f32(float* xout, float* x, float* w, int n, int d) {
-    // W (d,n) @ x (n,) -> xout (d,)
-    // by far the most amount of time is spent inside this little function
-    int i;
-    #pragma omp parallel for private(i)
-    for (i = 0; i < d; i++) {
-        float val = 0.0f;
-        for (int j = 0; j < n; j++) {
-            val += w[i * n + j] * x[j];
-        }
-        xout[i] = val;
-    }
-}
-
 void matmul(float* xout, QuantizedTensor *x, QuantizedTensor *w, int n, int d) {
     // W (d,n) @ x (n,) -> xout (d,)
     // by far the most amount of time is spent inside this little function
@@ -362,8 +345,10 @@ float* forward(Transformer* transformer, int token, int pos) {
     int hidden_dim =  p->hidden_dim;
     int head_size = dim / p->n_heads;
 
-    // copy the token embedding into x
-    memcpy(x, w->token_embedding_table + token*dim, dim * sizeof(float));
+    // dequantize q_tokens into x
+    for (int i = 0; i < dim; i++) {
+        x[i] = w->q_tokens->q[i + token * dim] * w->q_tokens->s[(i + token * dim) / GS];
+    }
 
     // forward all the layers
     for(int l = 0; l < p->n_layers; l++) {
@@ -483,7 +468,8 @@ float* forward(Transformer* transformer, int token, int pos) {
     rmsnorm(x, x, w->rms_final_weight, dim);
 
     // classifier into logits
-    matmul_f32(s->logits, x, w->wcls, dim, p->vocab_size);
+    quantize(&s->xq, x, dim);
+    matmul(s->logits, &s->xq, w->wcls, dim, p->vocab_size);
     return s->logits;
 }
 
