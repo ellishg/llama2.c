@@ -8,6 +8,7 @@
 #include <math.h>
 #include <string.h>
 #include <fcntl.h>
+#include <assert.h>
 #if defined _WIN32
     #include "win.h"
 #else
@@ -38,8 +39,7 @@ typedef struct {
 
 typedef struct {
     // token embedding table
-    QuantizedTensor *q_tokens; // (vocab_size, dim)
-    float* token_embedding_table; // same, but dequantized
+    float* token_embedding_table; // (vocab_size, dim)
 
     // weights for rmsnorms
     float* rms_att_weight; // (layer, dim) rmsnorm weights
@@ -56,7 +56,7 @@ typedef struct {
     // final rmsnorm
     float* rms_final_weight; // (dim,)
     // (optional) classifier weights for the logits, on the last layer
-    QuantizedTensor *wcls;
+    float *wcls;
 } TransformerWeights;
 
 typedef struct {
@@ -136,12 +136,6 @@ void free_run_state(RunState* s) {
 // ----------------------------------------------------------------------------
 // Quantization functions
 
-void dequantize(QuantizedTensor *qx, float* x, int n) {
-    for (int i = 0; i < n; i++) {
-        x[i] = qx->q[i] * qx->s[i / GS];
-    }
-}
-
 void quantize(QuantizedTensor *qx, float* x, int n) {
     int num_groups = n / GS;
     float Q_MAX = 127.0f;
@@ -196,13 +190,11 @@ void memory_map_weights(TransformerWeights *w, Config* p, void* ptr, uint8_t sha
     fptr += p->n_layers * p->dim;
     w->rms_final_weight = fptr;
     fptr += p->dim;
+    w->token_embedding_table = fptr;
+    fptr += p->vocab_size * p->dim;
 
     // now read all the quantized weights
     ptr = (void*)fptr; // now cast the pointer back to void*
-    w->q_tokens = init_quantized_tensors(&ptr, 1, p->vocab_size * p->dim);
-    // dequantize token embedding table
-    w->token_embedding_table = malloc(p->vocab_size * p->dim * sizeof(float));
-    dequantize(w->q_tokens, w->token_embedding_table, p->vocab_size * p->dim);
 
     w->wq = init_quantized_tensors(&ptr, p->n_layers, p->dim * (p->n_heads * head_size));
     w->wk = init_quantized_tensors(&ptr, p->n_layers, p->dim * (p->n_kv_heads * head_size));
@@ -213,7 +205,9 @@ void memory_map_weights(TransformerWeights *w, Config* p, void* ptr, uint8_t sha
     w->w2 = init_quantized_tensors(&ptr, p->n_layers, p->hidden_dim * p->dim);
     w->w3 = init_quantized_tensors(&ptr, p->n_layers, p->dim * p->hidden_dim);
 
-    w->wcls = shared_classifier ? w->q_tokens : init_quantized_tensors(&ptr, 1, p->dim * p->vocab_size);
+    // Force wcls to be float because it is shared with the token embedding table, which must be a float
+    assert(shared_classifier);
+    w->wcls = w->token_embedding_table;
 }
 
 void read_checkpoint(char* checkpoint, Config* config, TransformerWeights* weights,
@@ -224,13 +218,16 @@ void read_checkpoint(char* checkpoint, Config* config, TransformerWeights* weigh
     uint32_t magic_number;
     if (fread(&magic_number, sizeof(uint32_t), 1, file) != 1) { exit(EXIT_FAILURE); }
     if (magic_number != 0x616b3432) { fprintf(stderr, "Bad magic number\n"); exit(EXIT_FAILURE); }
-    // read in the version number (uint32), has to be 2
+    // read in the version number (uint32), has to be 3
     int version;
     if (fread(&version, sizeof(int), 1, file) != 1) { exit(EXIT_FAILURE); }
-    if (version != 2) { fprintf(stderr, "Bad version %d, need version 2\n", version); exit(EXIT_FAILURE); }
-    int header_size = 256; // the header size for version 2 in bytes
+    if (version != 3) { fprintf(stderr, "Bad version %d, need version 3\n", version); exit(EXIT_FAILURE); }
+    int header_size = 256; // the header size for version 3 in bytes
     // read in the Config
     if (fread(config, sizeof(Config), 1, file) != 1) { exit(EXIT_FAILURE); }
+    printf("Read config: dim=%d, hidden_dim=%d, n_layers=%d, n_heads=%d, n_kv_heads=%d, vocab_size=%d, seq_len=%d\n",
+           config->dim, config->hidden_dim, config->n_layers, config->n_heads,
+           config->n_kv_heads, config->vocab_size, config->seq_len);
     // read in flags
     uint8_t shared_classifier; // a byte to indicate if the classifier is shared
     if (fread(&shared_classifier, sizeof(uint8_t), 1, file) != 1) { exit(EXIT_FAILURE); }
@@ -259,8 +256,6 @@ void build_transformer(Transformer *t, char* checkpoint_path) {
 
 void free_transformer(Transformer* t) {
     // free QuantizedTensors
-    free(t->weights.q_tokens);
-    free(t->weights.token_embedding_table);
     free(t->weights.wq);
     free(t->weights.wk);
     free(t->weights.wv);
@@ -268,7 +263,6 @@ void free_transformer(Transformer* t) {
     free(t->weights.w1);
     free(t->weights.w2);
     free(t->weights.w3);
-    if(t->weights.wcls != t->weights.q_tokens) { free(t->weights.wcls); }
     // close the memory mapping
     if (t->data != MAP_FAILED) { munmap(t->data, t->file_size); }
     if (t->fd != -1) { close(t->fd); }
@@ -311,6 +305,20 @@ void softmax(float* x, int size) {
     // normalize
     for (int i = 0; i < size; i++) {
         x[i] /= sum;
+    }
+}
+
+void matmul_f32(float* xout, float* x, float* w, int n, int d) {
+    // W (d,n) @ x (n,) -> xout (d,)
+    // by far the most amount of time is spent inside this little function
+    int i;
+    #pragma omp parallel for private(i)
+    for (i = 0; i < d; i++) {
+        float val = 0.0f;
+        for (int j = 0; j < n; j++) {
+            val += w[i * n + j] * x[j];
+        }
+        xout[i] = val;
     }
 }
 
@@ -475,8 +483,7 @@ float* forward(Transformer* transformer, int token, int pos) {
     rmsnorm(x, x, w->rms_final_weight, dim);
 
     // classifier into logits
-    quantize(&s->xq, x, dim);
-    matmul(s->logits, &s->xq, w->wcls, dim, p->vocab_size);
+    matmul_f32(s->logits, x, w->wcls, dim, p->vocab_size);
     return s->logits;
 }
 
