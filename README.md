@@ -415,10 +415,31 @@ If your candidate PRs have elements of these it doesn't mean they won't get merg
 MIT
 
 ## Custom Model
+https://huggingface.co/ellishg/tinyllamas/tree/main
+
+The goal is to have a ~14MB model.
 
 ```
 python tinystories.py download
-python tinystories.py train_vocab --vocab_size=512
-python tinystories.py pretokenize --vocab_size=512
-python train.py --out_dir="out" --batch_size=128 --max_seq_len=512 --gradient_accumulation_steps=1 --vocab_source="custom" --vocab_size=512 --dim=64 --n_layers=5 --n_heads=8 --n_kv_heads=4 --multiple_of=4 --learning_rate=1e-3 --dropout=0.05 --weight_decay=0.01 --max_iters=100000 --beta2=0.99 --warmup_iters=1000 --eval_interval=2000 --eval_iters=100 --compile=True
+python tinystories.py train_vocab --vocab_size=4096
+python tinystories.py pretokenize --vocab_size=4096
+python tokenizer.py --tokenizer-model=data/tok4096.model
+python train.py --out_dir="out_3_5m_f32" --batch_size=128 --max_seq_len=256 --gradient_accumulation_steps=1 --vocab_source="custom" --vocab_size=4096 --dim=208 --n_layers=6 --n_heads=8 --n_kv_heads=4 --multiple_of=4 --learning_rate=1e-3 --dropout=0.05 --weight_decay=0.01 --max_iters=100000 --beta2=0.99 --warmup_iters=1000 --eval_interval=2000 --eval_iters=100 --compile=False --device="mps"
+# --batch_size=16 --gradient_accumulation_steps=8 --eval_interval=2
+
+./run out_3_5m_f32/model.bin -z data/tok4096.bin
+```
+
+
+### int8 quantization
+```
+python tinystories.py download
+python tinystories.py train_vocab --vocab_size=32000
+python tinystories.py pretokenize --vocab_size=32000
+python tokenizer.py --tokenizer-model=data/tok32000.model
+python train.py --out_dir="out_3_5m" --batch_size=128 --max_seq_len=512 --gradient_accumulation_steps=1 --vocab_source="custom" --vocab_size=32000 --dim=256 --n_layers=8 --n_heads=8 --n_kv_heads=4 --multiple_of=4 --learning_rate=1e-3 --dropout=0.05 --weight_decay=0.01 --max_iters=100000 --beta2=0.99 --warmup_iters=1000 --eval_interval=2000 --eval_iters=100 --compile=False --device="mps"
+# --batch_size=16 --gradient_accumulation_steps=8 --eval_interval=2
+python export.py --checkpoint out_3_5m/ckpt.pt --version 2 out_3_5m/model_q8.bin
+
+./runq out_3_5m/model_q8.bin -z data/tok32000.bin
 ```
