@@ -219,7 +219,7 @@ def version2_export(model, filepath, group_size=64):
     # 3) write the params, which will be 7 ints
     p = model.params
     hidden_dim = model.layers[0].feed_forward.w1.weight.shape[0]
-    assert hidden_dim % 16
+    assert hidden_dim % 16 == 0
     assert hidden_dim % group_size == 0
     # group_size should be as large as possible
     n_kv_heads = p.n_heads if p.n_kv_heads is None else p.n_kv_heads
