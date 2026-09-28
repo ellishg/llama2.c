@@ -179,7 +179,7 @@ def version1_export(model, filepath):
     out_file.close()
     print(f"wrote {filepath}")
 
-def version2_export(model, filepath, group_size=64):
+def version2_export(model, filepath, group_size=256):
     """
     Export the model weights in Q8_0 into .bin file to be read from C.
     That is:
